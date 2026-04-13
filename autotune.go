@@ -6,17 +6,20 @@ package excelize
 
 import "fmt"
 
-// AutoTuneProfile is implemented by each streaming-profile type. Its tune
-// method receives the machine's currently available memory (in bytes) and
-// returns recommended streaming I/O settings. Fields already set to non-zero
-// values in Options are never overridden, so profiles can be mixed with
-// explicit overrides.
+// AutoTuneProfile is implemented by each streaming-profile type. Its Tune
+// method receives the machine's currently available memory and the free space
+// in the OS temp directory (both in bytes) and returns recommended streaming
+// I/O settings. Fields already set to non-zero values in Options are never
+// overridden, so profiles can be mixed with explicit overrides.
+//
+// availDisk is -1 when the query fails; implementations must treat a negative
+// value as "disk space unknown" and skip any disk-based logic.
 //
 // The four built-in profiles are AutoTuneNone, AutoTuneMemoryOptimized,
 // AutoTuneDiskOptimized, and AutoTuneBalanced. The zero value of
 // Options.AutoTune (nil) behaves identically to AutoTuneNone.
 type AutoTuneProfile interface {
-	Tune(availMem int64) autoTuneSettings
+	Tune(availMem, availDisk int64) autoTuneSettings
 }
 
 // autoTuneSettings holds the streaming I/O parameters resolved by a profile.
@@ -52,21 +55,26 @@ type (
 	autoTuneBalancedProfile struct{}
 )
 
-func (autoTuneNoneProfile) Tune(_ int64) autoTuneSettings { return autoTuneSettings{} }
+func (autoTuneNoneProfile) Tune(_, _ int64) autoTuneSettings { return autoTuneSettings{} }
 
 // AutoTuneMemoryOptimized minimises peak heap usage by spilling XML data to a
 // temp file early and using standard deflate compression (which produces the
 // smallest ZIP output and therefore the least data traversing the output
 // pipeline).
 //
-// Streaming thresholds are derived from available memory:
+// Streaming thresholds are derived from available memory and disk space:
 //
 //	ChunkSize   = clamp(availMem/32, 1 MiB, 4 MiB)
+//	            = -1 (never spill) when availDisk < 1 GiB
 //	BufSize     = 32 KiB
 //	Compression = CompressionDefault
-func (autoTuneMemoryProfile) Tune(availMem int64) autoTuneSettings {
+func (autoTuneMemoryProfile) Tune(availMem, availDisk int64) autoTuneSettings {
+	chunk := clampUint64(availMem/32, autoTuneMinChunk, 4<<20)
+	if availDisk >= 0 && availDisk < autoTuneDiskSpillMin {
+		chunk = -1 // disk too full to spill safely; keep everything in memory
+	}
 	return autoTuneSettings{
-		chunkSize: clampUint64(availMem/32, autoTuneMinChunk, 4<<20),
+		chunkSize: chunk,
 		bufSize:   autoTuneMinBuf,
 		// CompressionDefault == 0; leaving compression zero means "no change".
 	}
@@ -76,17 +84,17 @@ func (autoTuneMemoryProfile) Tune(availMem int64) autoTuneSettings {
 // long as possible and writing large batches when the threshold is eventually
 // crossed. Disabling ZIP compression further reduces write amplification.
 //
-// Streaming thresholds are derived from available memory:
+// Streaming thresholds are derived from available memory and disk space:
 //
-//	ChunkSize   = -1 (never spill) when availMem >= 2 GiB,
+//	ChunkSize   = -1 (never spill) when availMem >= 2 GiB or availDisk < 1 GiB,
 //	              otherwise clamp(availMem/2, 64 MiB, 512 MiB)
 //	BufSize     = clamp(availMem/1000, 512 KiB, 4 MiB)
 //	Compression = CompressionNone
-func (autoTuneDiskProfile) Tune(availMem int64) autoTuneSettings {
+func (autoTuneDiskProfile) Tune(availMem, availDisk int64) autoTuneSettings {
 	chunk := clampUint64(availMem/2, 64<<20, autoTuneMaxChunk)
 	const twoGiB = 2 << 30
-	if availMem >= twoGiB {
-		chunk = -1 // never spill to disk
+	if availMem >= twoGiB || (availDisk >= 0 && availDisk < autoTuneDiskSpillMin) {
+		chunk = -1 // never spill: RAM is plentiful or disk is nearly full
 	}
 	return autoTuneSettings{
 		chunkSize:   chunk,
@@ -98,14 +106,19 @@ func (autoTuneDiskProfile) Tune(availMem int64) autoTuneSettings {
 // AutoTuneBalanced splits the workload evenly: moderate chunk size, 256 KiB
 // write buffer, and best-speed compression.
 //
-// Streaming thresholds are derived from available memory:
+// Streaming thresholds are derived from available memory and disk space:
 //
 //	ChunkSize   = clamp(availMem/8, 16 MiB, 64 MiB)
+//	            = -1 (never spill) when availDisk < 1 GiB
 //	BufSize     = 256 KiB
 //	Compression = CompressionBestSpeed
-func (autoTuneBalancedProfile) Tune(availMem int64) autoTuneSettings {
+func (autoTuneBalancedProfile) Tune(availMem, availDisk int64) autoTuneSettings {
+	chunk := clampUint64(availMem/8, 16<<20, 64<<20)
+	if availDisk >= 0 && availDisk < autoTuneDiskSpillMin {
+		chunk = -1 // disk too full to spill safely; keep everything in memory
+	}
 	return autoTuneSettings{
-		chunkSize:   clampUint64(availMem/8, 16<<20, 64<<20),
+		chunkSize:   chunk,
 		bufSize:     256 << 10,
 		compression: CompressionBestSpeed,
 	}
@@ -141,6 +154,12 @@ const (
 
 	autoTuneMinBuf int64 = 32 << 10 // 32 KiB
 	autoTuneMaxBuf int64 = 4 << 20  // 4 MiB
+
+	// autoTuneDiskSpillMin is the minimum free space required in the OS temp
+	// directory for any profile to spill XML data to disk. When free space
+	// drops below this threshold, the chunk size is forced to -1 (never
+	// spill) regardless of memory pressure.
+	autoTuneDiskSpillMin int64 = 1 << 30 // 1 GiB
 )
 
 // clampUInt64 returns v clamped to [lo, hi].
@@ -170,8 +189,9 @@ func applyAutoTune(opts *Options) {
 	if availMem <= 0 {
 		availMem = autoTuneFallbackMem
 	}
+	availDisk := availableDiskBytes()
 
-	s := opts.AutoTune.Tune(availMem)
+	s := opts.AutoTune.Tune(availMem, availDisk)
 	if opts.StreamingChunkSize == 0 && s.chunkSize != 0 {
 		opts.StreamingChunkSize = int(s.chunkSize)
 	}

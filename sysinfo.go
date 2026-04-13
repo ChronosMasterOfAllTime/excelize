@@ -5,6 +5,9 @@
 package excelize
 
 import (
+	"os"
+
+	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
@@ -21,4 +24,14 @@ func availableMemoryBytes() int64 {
 		return autoTuneFallbackMem
 	}
 	return int64(v.Available)
+}
+
+// availableDiskBytes returns the free space in the OS temp directory in bytes.
+// Returns -1 when the query fails, which callers must treat as "unknown".
+func availableDiskBytes() int64 {
+	d, err := disk.Usage(os.TempDir())
+	if err != nil || d == nil {
+		return -1
+	}
+	return int64(d.Free)
 }

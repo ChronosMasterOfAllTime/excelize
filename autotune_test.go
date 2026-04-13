@@ -32,9 +32,10 @@ func TestAutoTuneMemoryOptimized(t *testing.T) {
 	opts := &Options{AutoTune: AutoTuneMemoryOptimized}
 	applyAutoTune(opts)
 
-	assert.Greater(t, opts.StreamingChunkSize, 0, "chunk size must be positive")
-	assert.LessOrEqual(t, opts.StreamingChunkSize, 4<<20, "chunk size must be ≤ 4 MiB")
-	assert.GreaterOrEqual(t, opts.StreamingChunkSize, int(autoTuneMinChunk), "chunk size must be ≥ 1 MiB")
+	// chunk is either -1 (disk safety guard fired) or in [1 MiB, 4 MiB]
+	assert.True(t, opts.StreamingChunkSize == -1 ||
+		(opts.StreamingChunkSize >= int(autoTuneMinChunk) && opts.StreamingChunkSize <= 4<<20),
+		"chunk must be -1 or in [1 MiB, 4 MiB], got %d", opts.StreamingChunkSize)
 
 	assert.Equal(t, int(autoTuneMinBuf), opts.StreamingBufSize, "buf size must be 32 KiB")
 	assert.Equal(t, CompressionDefault, opts.Compression, "compression must remain Default")
@@ -88,8 +89,10 @@ func TestAutoTuneBalanced(t *testing.T) {
 	opts := &Options{AutoTune: AutoTuneBalanced}
 	applyAutoTune(opts)
 
-	assert.GreaterOrEqual(t, opts.StreamingChunkSize, 16<<20, "balanced chunk must be ≥ 16 MiB")
-	assert.LessOrEqual(t, opts.StreamingChunkSize, 64<<20, "balanced chunk must be ≤ 64 MiB")
+	// chunk is either -1 (disk safety guard fired) or in [16 MiB, 64 MiB]
+	assert.True(t, opts.StreamingChunkSize == -1 ||
+		(opts.StreamingChunkSize >= 16<<20 && opts.StreamingChunkSize <= 64<<20),
+		"balanced chunk must be -1 or in [16 MiB, 64 MiB], got %d", opts.StreamingChunkSize)
 
 	assert.Equal(t, 256<<10, opts.StreamingBufSize, "balanced buf size must be 256 KiB")
 	assert.Equal(t, CompressionBestSpeed, opts.Compression, "balanced must use CompressionBestSpeed")
@@ -211,4 +214,57 @@ func TestAvailableMemoryBytes(t *testing.T) {
 	assert.Greater(t, mem, int64(0), "available memory must be positive")
 	// Any reasonable machine has at least 256 MiB
 	assert.GreaterOrEqual(t, mem, int64(256<<20), "expected at least 256 MiB available")
+}
+
+// TestAvailableDiskBytes sanity-checks that availableDiskBytes returns either
+// -1 (query failed) or a positive value.
+func TestAvailableDiskBytes(t *testing.T) {
+	d := availableDiskBytes()
+	if d == -1 {
+		t.Log("availableDiskBytes returned -1 (query failed on this platform)")
+		return
+	}
+	assert.Greater(t, d, int64(0), "available disk must be positive")
+}
+
+// TestAutoTuneDiskSpillGuard verifies that profiles force chunkSize = -1
+// when availDisk is below the safety threshold.
+func TestAutoTuneDiskSpillGuard(t *testing.T) {
+	tinyDisk := autoTuneDiskSpillMin - 1 // just below threshold
+	enoughMem := int64(8 << 30)          // 8 GiB — plenty of RAM
+
+	// MemoryOptimized: would normally spill, but must back off
+	s := autoTuneMemoryProfile{}.Tune(enoughMem, tinyDisk)
+	assert.Equal(t, int64(-1), s.chunkSize, "MemoryOptimized must never-spill when disk is tight")
+
+	// Balanced: same expectation
+	s = autoTuneBalancedProfile{}.Tune(enoughMem, tinyDisk)
+	assert.Equal(t, int64(-1), s.chunkSize, "Balanced must never-spill when disk is tight")
+
+	// DiskOptimized with RAM < 2 GiB: would normally spill, but must back off
+	s = autoTuneDiskProfile{}.Tune(1<<30, tinyDisk)
+	assert.Equal(t, int64(-1), s.chunkSize, "DiskOptimized must never-spill when disk is tight")
+}
+
+// TestAutoTuneDiskSpillGuardAboveThreshold verifies that profiles use
+// normal positive chunk sizes when disk space is plentiful.
+func TestAutoTuneDiskSpillGuardAboveThreshold(t *testing.T) {
+	enoughDisk := autoTuneDiskSpillMin + int64(1<<30) // 1 GiB above threshold
+	enoughMem := int64(8 << 30)
+
+	s := autoTuneMemoryProfile{}.Tune(enoughMem, enoughDisk)
+	assert.Greater(t, s.chunkSize, int64(0), "MemoryOptimized must use positive chunk when disk is plentiful")
+
+	s = autoTuneBalancedProfile{}.Tune(enoughMem, enoughDisk)
+	assert.Greater(t, s.chunkSize, int64(0), "Balanced must use positive chunk when disk is plentiful")
+}
+
+// TestAutoTuneDiskSpillGuardUnknownDisk verifies that profiles behave normally
+// when availDisk is -1 (unknown), i.e. the safety guard is not triggered.
+func TestAutoTuneDiskSpillGuardUnknownDisk(t *testing.T) {
+	s := autoTuneMemoryProfile{}.Tune(8<<30, -1)
+	assert.Greater(t, s.chunkSize, int64(0), "MemoryOptimized must spill normally when disk is unknown")
+
+	s = autoTuneBalancedProfile{}.Tune(8<<30, -1)
+	assert.Greater(t, s.chunkSize, int64(0), "Balanced must spill normally when disk is unknown")
 }
